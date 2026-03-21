@@ -6,7 +6,7 @@ This document defines the **complete agentic system design** for the platform, c
 
 ## Summary: How Many Agents?
 
-**Total: 9 Agents**
+**Total: 11 Agents**
 
 | # | Agent Name | Type | LangGraph Role | Primary Responsibility |
 |---|-----------|------|---------------|----------------------|
@@ -19,8 +19,10 @@ This document defines the **complete agentic system design** for the platform, c
 | 7 | Feedback Composer Agent | Sub-Agent | Node in Assessment graph | Synthesises all scores into corrected transcripts, explanations, model answers |
 | 8 | Learning Pathway Agent | Sub-Agent | Node in Assessment graph | Generates personalised weekly learning roadmaps from weakness profiles |
 | 9 | Risk Monitor Agent | **Background Agent** | Scheduled `StateGraph` | Continuously scans for stagnation/decline; fires teacher alerts |
+| 10 | Classifier Agent | **Infrastructure Agent** | Pre-orchestrator gate | Classifies every inbound request by role, intent, and pathway; routes to the correct orchestrator |
+| 11 | Context Manager Agent | **Infrastructure Agent** | Cross-cutting shared service | Manages short-term (Redis) and long-term (PostgreSQL) context windows for all orchestrators |
 
-> **Design Pattern Used:** Hierarchical **Orchestrator → Sub-Agent** pattern implemented with **LangGraph `StateGraph`** for orchestrators and **LangChain `Tool`** definitions for sub-agents. All traces flow through **LangSmith** for observability and cost tracking.
+> **Design Pattern Used:** Hierarchical **Orchestrator → Sub-Agent** pattern implemented with **LangGraph `StateGraph`** for orchestrators and **LangChain `Tool`** definitions for sub-agents. Agents 10 and 11 act as **cross-cutting infrastructure** that every orchestrator uses before starting its own state machine. All traces flow through **LangSmith** for observability and cost tracking.
 
 ---
 
@@ -88,6 +90,29 @@ This document defines the **complete agentic system design** for the platform, c
 - **Output**: At-risk student flags written to database + teacher notifications fired
 - **Threshold rule**: Flag if no score improvement over 3 consecutive assessments OR score decreases >10%
 
+### Infrastructure / Supporting Agents
+
+#### Agent 10 — Classifier Agent
+- **Position in architecture**: Sits at the API Gateway boundary, **before** any orchestrator is invoked
+- **Trigger**: Every inbound request from any user (Learner, Teacher, Recruiter, Admin, Research Analyst)
+- **Responsibility**: Parses the request, identifies the user's role, intent, and session type, then routes to the correct orchestrator or service. Also pre-classifies the learner pathway (CEFR vs. IELTS) so the Assessment Orchestrator receives a fully labelled context object and does not need to re-ask
+- **Tools**: `decode_jwt_claims`, `classify_user_role`, `classify_intent`, `classify_session_type`, `classify_learning_pathway`, `route_to_orchestrator`, `return_clarification_request`
+- **Input**: Raw HTTP request headers + JWT token + request body
+- **Output**: `ClassifiedRequest` object — `{user_id, role, intent, session_type, pathway, orchestrator_target}`
+- **Failure mode**: If intent cannot be determined with confidence ≥ 0.85, returns a structured clarification prompt to the frontend rather than routing blindly
+
+#### Agent 11 — Context Manager Agent
+- **Position in architecture**: Cross-cutting shared service called by **every orchestrator** at the start and end of each state machine execution
+- **Trigger**: Called by Assessment Orchestrator, Recruiter Screening Orchestrator, and Risk Monitor Agent at `START` and `END` of every run
+- **Responsibility**: Provides two-tier memory management —
+  - **Short-term (Redis)**: Stores in-flight session state so that an interrupted assessment (page refresh, network drop) can be resumed without re-processing completed steps
+  - **Long-term (PostgreSQL)**: Maintains a structured `UserContextProfile` (full assessment history, weakness profile, pathway history, activity completion log) so orchestrators always have a rich, up-to-date context window without querying multiple tables
+- **Tools**: `store_session_context`, `retrieve_session_context`, `clear_session`, `get_user_context_profile`, `update_weakness_profile`, `append_assessment_to_history`, `prune_stale_sessions`
+- **Input (read)**: `user_id` + `session_id` → returns `UserContextProfile` + `SessionState`
+- **Input (write)**: Any orchestrator's partial or final state object
+- **Output**: Enriched context object OR confirmation of successful state write
+- **Context window rule**: The `UserContextProfile` returned to LLM-backed agents (Agents 6 and 7) is trimmed to the last 3 assessments to keep token usage within the Vertex AI context window budget
+
 ---
 
 ## 2. Orchestrator–Sub-Agent Architecture Overview
@@ -96,8 +121,14 @@ This document defines the **complete agentic system design** for the platform, c
 graph TB
     subgraph Triggers["External Triggers"]
         L([👤 Learner])
+        T([🎓 Teacher])
         R([🏢 Recruiter])
         CRON([⏱️ Daily Cron])
+    end
+
+    subgraph InfraAgents["Infrastructure Agents (Cross-Cutting)"]
+        CLS["🔀 Agent 10\nClassifier Agent\nRoute & Intent Classification"]
+        CTX["🗄️ Agent 11\nContext Manager Agent\nRedis + PostgreSQL Memory"]
     end
 
     subgraph Orchestrators["Orchestrators (LangGraph StateGraphs)"]
@@ -120,13 +151,26 @@ graph TB
         STT[Google Cloud STT]
         LANGSMITH[LangSmith\nTracing & Observability]
         DB[(PostgreSQL\nData Store)]
+        REDIS[(Redis\nSession Cache)]
         ATS[ATS API\nGreenhouse / Lever]
     end
 
-    %% Learner triggers Assessment Orchestrator
-    L -->|Start Assessment| ORC1
-    R -->|Start Screening| ORC2
+    %% All user requests first hit the Classifier Agent
+    L -->|HTTP Request| CLS
+    T -->|HTTP Request| CLS
+    R -->|HTTP Request| CLS
     CRON -->|Daily Run| ORC9
+
+    %% Classifier routes to correct orchestrator
+    CLS -->|role=Learner intent=assessment| ORC1
+    CLS -->|role=Recruiter intent=screening| ORC2
+
+    %% Every orchestrator reads/writes context via Context Manager
+    CTX -->|UserContextProfile + SessionState| ORC1
+    CTX -->|UserContextProfile + SessionState| ORC2
+    CTX -->|Learner history| ORC9
+    ORC1 -->|Write session state| CTX
+    ORC2 -->|Write session state| CTX
 
     %% Assessment Orchestrator delegates to sub-agents
     ORC1 -->|Select Questions| SA3
@@ -146,6 +190,10 @@ graph TB
     ORC9 -->|Read Scores| DB
     ORC9 -->|Write Flags| DB
 
+    %% Context Manager storage backends
+    CTX -->|Short-term state| REDIS
+    CTX -->|Long-term history| DB
+
     %% Sub-agent external calls
     SA4 -->|Transcribe Audio| STT
     SA6 -->|Coherence API| VERTEXAI
@@ -155,6 +203,8 @@ graph TB
     ORC1 -.->|Trace| LANGSMITH
     ORC2 -.->|Trace| LANGSMITH
     ORC9 -.->|Trace| LANGSMITH
+    CLS -.->|Trace| LANGSMITH
+    CTX -.->|Trace| LANGSMITH
 
     %% Data persistence
     SA3 --> DB
@@ -164,6 +214,7 @@ graph TB
     ORC2 -->|Push Results| ATS
 
     style Triggers fill:#dbeafe,stroke:#3b82f6
+    style InfraAgents fill:#f3e8ff,stroke:#a855f7
     style Orchestrators fill:#fce7f3,stroke:#ec4899
     style SubAgents fill:#dcfce7,stroke:#22c55e
     style ExternalServices fill:#fff7ed,stroke:#f97316
@@ -563,8 +614,8 @@ graph TD
 
 | Agent | Framework | LLM/AI Backend | Tools / Libraries | Trigger |
 |-------|-----------|---------------|-------------------|---------|
-| Assessment Orchestrator | LangGraph `StateGraph` | — | LangChain, LangSmith | REST API call from backend |
-| Recruiter Orchestrator | LangGraph `StateGraph` | — | LangChain, LangSmith | REST API call from backend |
+| Assessment Orchestrator | LangGraph `StateGraph` | — | LangChain, LangSmith | Routed by Classifier Agent |
+| Recruiter Orchestrator | LangGraph `StateGraph` | — | LangChain, LangSmith | Routed by Classifier Agent |
 | Question Selector | LangChain `Tool` | — | PostgreSQL client, pandas | Called by orchestrators |
 | Speech Analysis | LangChain `Tool` | Google Cloud STT | `google-cloud-speech`, `librosa` | Called by orchestrators |
 | Rule-Based Evaluator | LangChain `Tool` | — | `language_tool_python`, `nltk`, custom rules | Called by orchestrators |
@@ -572,10 +623,227 @@ graph TD
 | Feedback Composer | LangChain `Tool` | Google Vertex AI (Gemini) | Template engine, diff library | Called by orchestrators |
 | Learning Pathway Agent | LangChain `Tool` | — | PostgreSQL client, rule engine | Called by orchestrators |
 | Risk Monitor Agent | LangGraph `StateGraph` | — | PostgreSQL client, notification client | Cron / `APScheduler` |
+| **Classifier Agent** | LangChain `Tool` + FastAPI middleware | — | PyJWT, intent classifier, Redis client | Every inbound HTTP request |
+| **Context Manager Agent** | LangChain `Tool` | — | `redis-py`, SQLAlchemy, PostgreSQL client | Called by every orchestrator at start/end |
 
 ---
 
-## 10. Cost Control Strategy
+## 10. Classifier Agent — Detailed Design (Agent 10)
+
+### Role in the System
+
+The Classifier Agent is the **single entry point** for every request entering the agent layer. It acts as the intelligent router that inspects every inbound HTTP request and produces a `ClassifiedRequest` object consumed by the correct orchestrator. Without it, each orchestrator would need to independently parse user identity, determine intent, and apply routing logic — duplicating logic and creating inconsistency.
+
+### What It Classifies
+
+| Dimension | Values | Source |
+|-----------|--------|--------|
+| **User Role** | Learner, Teacher, Recruiter, Admin, Research Analyst | JWT claims (`role` field) |
+| **Intent** | `start_assessment`, `view_dashboard`, `initiate_screening`, `join_class`, `export_data`, `configure_bank` | Request path + body |
+| **Session Type** | `new_assessment`, `reassessment`, `recruiter_screen`, `teacher_review`, `admin_action` | User history + request type |
+| **Learning Pathway** | `CEFR`, `IELTS` | Learner profile goal (pre-loaded from DB) |
+| **Orchestrator Target** | `AssessmentOrchestrator`, `RecruiterOrchestrator`, `AdminService`, `TeacherService` | Derived from role + intent |
+
+### Tool Registry
+
+| Tool | Responsibility |
+|------|---------------|
+| `decode_jwt_claims` | Extract `user_id`, `role`, `institution_id` from the signed JWT |
+| `classify_user_role` | Validate and normalise role to one of the 5 known user types |
+| `classify_intent` | Match request path + action field to a known intent enum |
+| `classify_session_type` | Cross-reference intent with user history to determine session type (new vs. re-assessment) |
+| `classify_learning_pathway` | Fetch learner goal from DB/Redis cache and return `CEFR` or `IELTS` |
+| `route_to_orchestrator` | Emit the `ClassifiedRequest` to the target orchestrator via internal event bus |
+| `return_clarification_request` | If confidence < 0.85, return a structured question to the frontend to resolve ambiguity |
+
+### Classification Flow
+
+```mermaid
+flowchart TD
+    REQ([Inbound HTTP Request]) --> DECODE[decode_jwt_claims\nExtract user_id, role]
+
+    DECODE --> ROLE_CHECK{Role valid?}
+    ROLE_CHECK -->|No| REJECT[Return 401 Unauthorized]
+    ROLE_CHECK -->|Yes| CLASSIFY_INTENT[classify_intent\nMatch path + body to intent enum]
+
+    CLASSIFY_INTENT --> INTENT_CONF{Intent confidence\ngreater than 0.85?}
+    INTENT_CONF -->|No| CLARIFY[return_clarification_request\nAsk frontend for disambiguation]
+    CLARIFY --> REQ
+
+    INTENT_CONF -->|Yes| CLASSIFY_SESSION[classify_session_type\nNew vs. reassessment?]
+    CLASSIFY_SESSION --> PATHWAY{Role = Learner?}
+
+    PATHWAY -->|Yes| CLASSIFY_PATHWAY[classify_learning_pathway\nLoad goal from Redis or DB]
+    PATHWAY -->|No| SKIP_PATHWAY[Pathway = N/A]
+
+    CLASSIFY_PATHWAY --> BUILD_OBJ[Build ClassifiedRequest\nuser_id, role, intent, session_type, pathway, target]
+    SKIP_PATHWAY --> BUILD_OBJ
+
+    BUILD_OBJ --> ROUTE{Orchestrator Target?}
+    ROUTE -->|AssessmentOrchestrator| ORC1[Route to Agent 1\nAssessment Orchestrator]
+    ROUTE -->|RecruiterOrchestrator| ORC2[Route to Agent 2\nRecruiter Orchestrator]
+    ROUTE -->|TeacherService| SVC_T[Route to Teacher\nDashboard Service]
+    ROUTE -->|AdminService| SVC_A[Route to Admin\nManagement Service]
+
+    style REJECT fill:#ffe4e6,stroke:#f87171
+    style CLARIFY fill:#fef9c3,stroke:#eab308
+    style BUILD_OBJ fill:#dcfce7,stroke:#22c55e
+```
+
+### ClassifiedRequest Object
+
+```typescript
+ClassifiedRequest {
+    user_id:             str          // from JWT
+    role:                RoleEnum     // Learner | Teacher | Recruiter | Admin | ResearchAnalyst
+    intent:              IntentEnum   // start_assessment | initiate_screening | view_dashboard | ...
+    session_type:        SessionEnum  // new_assessment | reassessment | recruiter_screen | ...
+    pathway:             PathwayEnum  // CEFR | IELTS | N/A
+    orchestrator_target: str          // AssessmentOrchestrator | RecruiterOrchestrator | ...
+    confidence:          float        // classification confidence score
+    timestamp:           datetime
+}
+```
+
+### Why It Matters
+
+- **Separation of concerns**: Orchestrators receive a fully labelled context and never contain routing logic
+- **Single responsibility**: All role/intent/pathway classification lives in one agent, making it easy to update without touching orchestrators
+- **Auditable routing**: Every routing decision is logged to LangSmith with the confidence score, enabling debugging of misrouted sessions
+- **Extensibility**: Adding a new user role or intent only requires updating the Classifier Agent, not all orchestrators
+
+---
+
+## 11. Context Manager Agent — Detailed Design (Agent 11)
+
+### Role in the System
+
+The Context Manager Agent is the **shared memory layer** for the entire agent network. It ensures that every orchestrator always starts a run with a complete, accurate picture of the user's history and active session — and ends a run by persisting the updated state. It prevents data loss on session interruption and keeps LLM context windows within budget by trimming history to the relevant window.
+
+### Two-Tier Memory Architecture
+
+| Tier | Backend | Data Stored | TTL / Retention |
+|------|---------|-------------|-----------------|
+| **Short-term (Session)** | Redis | In-flight `SessionState` (current step, partial scores, audio job ID) | 24 hours from last write |
+| **Long-term (Profile)** | PostgreSQL | `UserContextProfile` (full assessment history, weakness profile, pathway history, activity log) | Indefinite (audit-grade) |
+
+### What It Stores Per User
+
+**`SessionState`** (Redis — per active session):
+```typescript
+SessionState {
+    session_id:      str
+    user_id:         str
+    orchestrator:    str           // which orchestrator owns this session
+    current_step:    str           // last completed LangGraph node
+    partial_scores:  dict          // scores computed so far (for resume)
+    audio_job_id:    str | null    // async STT job ID if in-flight
+    created_at:      datetime
+    last_updated:    datetime
+}
+```
+
+**`UserContextProfile`** (PostgreSQL — per user, always up to date):
+```typescript
+UserContextProfile {
+    user_id:              str
+    role:                 RoleEnum
+    pathway:              PathwayEnum
+    current_level:        str       // CEFR sublevel or IELTS band
+    weakness_profile:     dict      // {grammar: 0.6, lexical: 0.8, fluency: 0.5, ...}
+    assessment_history:   list      // last N assessments (trimmed to 3 for LLM context)
+    activity_log:         list      // completed activities (last 4 weeks)
+    improvement_index:    float     // composite progress metric
+    last_assessment_date: datetime
+}
+```
+
+### Tool Registry
+
+| Tool | Responsibility |
+|------|---------------|
+| `store_session_context` | Write/update `SessionState` in Redis with a 24h TTL |
+| `retrieve_session_context` | Fetch `SessionState` from Redis by `session_id`; return `null` if expired |
+| `clear_session` | Delete `SessionState` from Redis after successful completion |
+| `get_user_context_profile` | Fetch full `UserContextProfile` from PostgreSQL |
+| `update_weakness_profile` | Merge new scoring results into the user's weakness dimension weights |
+| `append_assessment_to_history` | Add a new assessment record to the user's longitudinal history |
+| `trim_context_for_llm` | Return only the last 3 assessments + current weakness profile (token-budget safe) |
+| `prune_stale_sessions` | Background cleanup: delete Redis keys older than TTL |
+
+### Context Read/Write Flow
+
+```mermaid
+sequenceDiagram
+    participant CLS as Classifier Agent<br/>(Agent 10)
+    participant ORC as Any Orchestrator<br/>(Agent 1 or 2)
+    participant CTX as Context Manager Agent<br/>(Agent 11)
+    participant REDIS as Redis Session Cache
+    participant DB as PostgreSQL User Profiles
+
+    CLS->>ORC: ClassifiedRequest{user_id, role, intent, ...}
+
+    Note over ORC,CTX: ON SESSION START — Context Read
+    ORC->>CTX: get_user_context_profile(user_id)
+    CTX->>REDIS: GET session_id
+    REDIS-->>CTX: SessionState (or null if new)
+    CTX->>DB: SELECT from user_context WHERE user_id
+    DB-->>CTX: UserContextProfile
+    CTX->>CTX: trim_context_for_llm(profile, max_assessments=3)
+    CTX-->>ORC: SessionState + UserContextProfile
+
+    Note over ORC: Orchestrator runs its state machine using enriched context
+
+    ORC->>ORC: Execute sub-agents 3 through 8
+
+    Note over ORC,CTX: AFTER EACH STEP — Partial State Write
+    ORC->>CTX: store_session_context(session_id, partial_state)
+    CTX->>REDIS: SET session_id partial_state EX 86400
+    REDIS-->>CTX: OK
+
+    Note over ORC,CTX: ON SESSION COMPLETE — Profile Update
+    ORC->>CTX: append_assessment_to_history(user_id, result)
+    CTX->>DB: INSERT INTO assessment_history
+    ORC->>CTX: update_weakness_profile(user_id, new_scores)
+    CTX->>DB: UPDATE user_context SET weakness_profile
+    ORC->>CTX: clear_session(session_id)
+    CTX->>REDIS: DEL session_id
+    CTX-->>ORC: Profile updated, session cleared
+```
+
+### Session Resume Flow (Interrupted Assessment)
+
+```mermaid
+flowchart TD
+    START([Learner returns after interruption]) --> CLS_CLASSIFY[Classifier Agent\nclassifies as session_resume]
+    CLS_CLASSIFY --> ORC_START[Assessment Orchestrator\ncalls get_user_context_profile]
+    ORC_START --> REDIS_CHECK{SessionState\nexists in Redis?}
+
+    REDIS_CHECK -->|Yes — within 24h| LOAD_STATE[Load partial_state\nfrom Redis]
+    LOAD_STATE --> RESUME_STEP[Resume LangGraph at\nlast_completed_step]
+    RESUME_STEP --> CONTINUE[Continue from where\nlearner left off]
+
+    REDIS_CHECK -->|No — expired or new| LOAD_PROFILE[Load UserContextProfile\nfrom PostgreSQL only]
+    LOAD_PROFILE --> START_FRESH[Start fresh assessment\nwith full historical context]
+
+    CONTINUE --> COMPLETE([Assessment completes normally])
+    START_FRESH --> COMPLETE
+
+    style LOAD_STATE fill:#dcfce7,stroke:#22c55e
+    style LOAD_PROFILE fill:#fef9c3,stroke:#eab308
+```
+
+### Why It Matters
+
+- **Resilience**: A network drop or browser refresh does not lose a learner's in-progress assessment — they resume from the last completed step
+- **Context quality**: Orchestrators receive a rich, pre-assembled context object instead of querying 4+ tables themselves
+- **Token budget enforcement**: The `trim_context_for_llm` function ensures LLM-backed agents (6 and 7) never exceed the Vertex AI context window, keeping AI call costs predictable
+- **Longitudinal accuracy**: Because every session end writes to `UserContextProfile`, the weakness profile and improvement index are always up to date for the Risk Monitor Agent, Learning Pathway Agent, and Teacher Dashboard
+- **Single source of truth**: All agents read user context from one place; no stale data from concurrent reads
+
+---
+
+## 12. Cost Control Strategy
 
 A critical business requirement is keeping AI costs to ≤2 Vertex AI calls per assessment. The following enforcement mechanism is built into Agent 6 and Agent 7:
 
@@ -609,22 +877,23 @@ flowchart TD
 
 ---
 
-## Summary
-
-| Category | Count | Names |
+## 13. Summary
 |----------|-------|-------|
 | **Orchestrators** | 2 | Assessment Orchestrator, Recruiter Screening Orchestrator |
 | **Sub-Agents** | 6 | Question Selector, Speech Analysis, Rule-Based Evaluator, AI Coherence Evaluator, Feedback Composer, Learning Pathway Agent |
 | **Background Agents** | 1 | Risk Monitor Agent |
-| **Total** | **9** | |
+| **Infrastructure Agents** | 2 | Classifier Agent, Context Manager Agent |
+| **Total** | **11** | |
 
 ### Implementation Order (Recommended)
-1. **Agent 4** (Speech Analysis) — foundation; everything depends on transcripts
-2. **Agent 5** (Rule-Based Evaluator) — core scoring; no external dependencies
-3. **Agent 3** (Question Selector) — enables assessments to run
-4. **Agent 1** (Assessment Orchestrator) — wires Agents 3, 4, 5 together; MVP-ready
-5. **Agent 6** (AI Coherence Evaluator) — adds AI layer on top of rule scores
-6. **Agent 7** (Feedback Composer) — completes the learner feedback loop
-7. **Agent 8** (Learning Pathway Agent) — personalised pathway generation
-8. **Agent 2** (Recruiter Screening Orchestrator) — recruiter flow
-9. **Agent 9** (Risk Monitor Agent) — background monitoring; can be added last
+1. **Agent 11** (Context Manager) — build the Redis + PostgreSQL memory layer first; everything depends on it
+2. **Agent 10** (Classifier) — build the routing gate so all requests are properly labelled before reaching orchestrators
+3. **Agent 4** (Speech Analysis) — foundation; everything depends on transcripts
+4. **Agent 5** (Rule-Based Evaluator) — core scoring; no external dependencies
+5. **Agent 3** (Question Selector) — enables assessments to run
+6. **Agent 1** (Assessment Orchestrator) — wires Agents 10, 11, 3, 4, 5 together; MVP-ready
+7. **Agent 6** (AI Coherence Evaluator) — adds AI layer on top of rule scores
+8. **Agent 7** (Feedback Composer) — completes the learner feedback loop
+9. **Agent 8** (Learning Pathway Agent) — personalised pathway generation
+10. **Agent 2** (Recruiter Screening Orchestrator) — recruiter flow
+11. **Agent 9** (Risk Monitor Agent) — background monitoring; can be added last
